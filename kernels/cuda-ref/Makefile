@@ -16,7 +16,13 @@ FASTSRC := secp256k1_fast.cu
 FASTHDR := secp256k1_field.cuh secp256k1_ec.cuh secp256k1_affine.cuh hash.cuh
 BATCH   ?= 256
 
-.PHONY: all clean verify scan bench fast fast-verify fast-scan fast-bench
+# Wave 3 Opt C variant (negation-map symmetry): same source, built with -DNEGMAP so each affine
+# point hashes BOTH compressed parities (02||x and 03||x), covering keys k and n-k. Separate binary
+# so the Opt A baseline stays byte-identical for honest A/B (the NEG branches DCE away without -DNEGMAP).
+NEGMAP_BIN := secp256k1_negmap
+
+.PHONY: all clean verify scan bench fast fast-verify fast-scan fast-bench \
+        negmap negmap-verify negmap-scan negmap-bench
 
 all: $(TARGET) $(FAST)
 
@@ -26,6 +32,10 @@ $(TARGET): $(SRC) $(HDRS)
 fast: $(FAST)
 $(FAST): $(FASTSRC) $(FASTHDR)
 	$(NVCC) $(NVFLAGS) -DBATCH=$(BATCH) -o $@ $(FASTSRC)
+
+negmap: $(NEGMAP_BIN)
+$(NEGMAP_BIN): $(FASTSRC) $(FASTHDR)
+	$(NVCC) $(NVFLAGS) -DBATCH=$(BATCH) -DNEGMAP -o $@ $(FASTSRC)
 
 # Run from repo root so the default test-vector path resolves.
 verify: $(TARGET)
@@ -45,5 +55,14 @@ fast-scan: $(FAST)
 fast-bench: $(FAST)
 	cd ../.. && kernels/cuda-ref/$(FAST) bench
 
+# Wave 3 Opt C run targets. negmap-verify expects NEGFILE (a kat_oracle.py negmap dump).
+NEGFILE ?= /tmp/negmap_1_1100.json
+negmap-verify: $(NEGMAP_BIN)
+	cd ../.. && kernels/cuda-ref/$(NEGMAP_BIN) negverify $(NEGFILE)
+negmap-scan: $(NEGMAP_BIN)
+	cd ../.. && kernels/cuda-ref/$(NEGMAP_BIN) scan
+negmap-bench: $(NEGMAP_BIN)
+	cd ../.. && kernels/cuda-ref/$(NEGMAP_BIN) bench
+
 clean:
-	rm -f $(TARGET) $(FAST) $(FAST)_b*
+	rm -f $(TARGET) $(FAST) $(NEGMAP_BIN) $(FAST)_b*

@@ -35,11 +35,69 @@
 // Per-key action specialized at compile time so the inner loop has no mode branch.
 enum WalkMode { MODE_EMIT = 0, MODE_BENCH = 1, MODE_SCAN = 2 };
 
-// Hash an affine point's compressed pubkey -> hash160 (20B). Shared by every mode.
+// NEG_DEFAULT selects the negation-map (Opt C) variant at COMPILE time. When NEGMAP is undefined
+// (the Opt A binary `secp256k1_fast`), NEG_DEFAULT==false and every `if (NEG)` below is dead-code-
+// eliminated, so the Opt A code path stays byte-identical for honest A/B. When built with -DNEGMAP
+// (the `secp256k1_negmap` binary), NEG_DEFAULT==true and each affine point hashes BOTH parities.
+#ifdef NEGMAP
+constexpr bool NEG_DEFAULT = true;
+constexpr int  KEYS_PER_POINT = 2;   // Opt C: each affine point covers k AND n-k (2 addresses)
+#else
+constexpr bool NEG_DEFAULT = false;
+constexpr int  KEYS_PER_POINT = 1;   // Opt A: each affine point covers exactly 1 key
+#endif
+
+// Hash an affine point's compressed pubkey -> hash160 (20B). Shared by every mode (Opt A path).
 __device__ __forceinline__ void affine_hash160(uint8_t h160[20], const affpt *P) {
     uint8_t pub[33];
     compressed_pubkey(pub, &P->x, &P->y);
     hash160_33(h160, pub);
+}
+
+// NEGATION-MAP hash (Opt C): from ONE affine point P=(x,y) for key k, produce BOTH hash160s:
+//   h_k    = hash160(prefix_k  || x)   prefix_k from parity of y           -> address of key k
+//   h_negk = hash160(prefix_k^1|| x)   the flipped-parity encoding         -> address of key n-k
+// Point -P = (x, p-y) has the SAME x and the OPPOSITE parity (p is odd), so the mirror key n-k's
+// compressed pubkey is byte-identical except prefix ^= 0x01 (0x02<->0x03). The 32 x-bytes — hence
+// the ENTIRE sha256 message except byte 0 — are shared; we still run 2 full hash160 (sha256 is
+// sequential, the differing byte is in word 0, so the blocks cannot be shared — see negmap notes).
+__device__ __forceinline__ void affine_hash160_negmap(uint8_t h_k[20], uint8_t h_negk[20],
+                                                       const affpt *P) {
+    uint8_t pub[33];
+    compressed_pubkey(pub, &P->x, &P->y);   // pub[0] = parity of y (the real key k's encoding)
+    hash160_33(h_k, pub);
+    pub[0] ^= 0x01u;                         // flip 0x02<->0x03 : the mirror key n-k's encoding
+    hash160_33(h_negk, pub);
+}
+
+// Per-point action for ONE hash160 (the body of every mode). Specialized at compile time so the
+// inner loop carries no mode branch. `side` distinguishes a neg-map k-match (0) from an n-k match
+// (1) for MODE_SCAN; ignored by EMIT/BENCH. For NEG=false this is invoked once per point with the
+// exact same effect as the original Opt A inner block.
+template <WalkMode MODE>
+__device__ __forceinline__ void emit_or_match(const uint8_t h160[20], long out_idx,
+                                              uint64_t keyVal, int side,
+                                              uint8_t *out, uint8_t *sink, const uint8_t *target20,
+                                              uint32_t *found_key, int *found_flag, int *found_side) {
+    if (MODE == MODE_EMIT) {
+#pragma unroll
+        for (int b = 0; b < 20; b++) out[out_idx * 20 + b] = h160[b];
+    } else if (MODE == MODE_BENCH) {
+        uint8_t acc = 0;
+#pragma unroll
+        for (int b = 0; b < 20; b++) acc ^= h160[b];
+        sink[out_idx & 1023] = acc;
+    } else { // MODE_SCAN
+        int m = 1;
+#pragma unroll
+        for (int b = 0; b < 20; b++) if (h160[b] != target20[b]) m = 0;
+        if (m && atomicExch(found_flag, 1) == 0) {
+            found_key[0] = (uint32_t)keyVal; found_key[1] = (uint32_t)(keyVal >> 32);
+#pragma unroll
+            for (int i = 2; i < 8; i++) found_key[i] = 0;  // small-key window
+            if (found_side) *found_side = side;
+        }
+    }
 }
 
 // The single walk routine used by ALL modes (verify == bench == scan crypto, byte-identical).
@@ -48,41 +106,37 @@ __device__ __forceinline__ void affine_hash160(uint8_t h160[20], const affpt *P)
 //   MODE_EMIT : write each hash160 to out[(localKeyIndex)*20]   (verify; low volume)
 //   MODE_BENCH: xor each hash160 into a tiny sink (throughput; keeps work live)
 //   MODE_SCAN : memcmp each hash160 to target20; on match record key + set found flag
-template <WalkMode MODE>
+//
+// NEG (Opt C, negation map): when true, each affine point P=(x,y) for key k yields TWO candidate
+// keys — k (parity-correct 02/03||x) and n-k (the flipped-parity encoding, = point -P). We hash
+// BOTH and process both. This HALVES the EC/walk work per address covered (one affine-add now
+// covers 2 keys) but does NOT reduce hash work (still 2 hash160/point). Output/index layout for
+// NEG: point at local index ki emits its k-hash at slot 2*ki and its n-k-hash at slot 2*ki+1.
+// When NEG=false every `if (NEG)` branch is dead-code-eliminated, so the Opt A path is unchanged.
+template <WalkMode MODE, bool NEG>
 __device__ void walk_thread(const affpt *table_s, affpt base, const uint32_t startKey_lo[2],
                             int steps,
                             uint8_t *out,            // MODE_EMIT
                             uint8_t *sink,           // MODE_BENCH
                             const uint8_t *target20, // MODE_SCAN
-                            uint32_t *found_key, int *found_flag,
+                            uint32_t *found_key, int *found_flag, int *found_side,
                             long localKeyBase) {
-    uint8_t h160[20];
+    uint8_t h160[20], h160b[20];
 
     // key counter (only the low 64 bits move within a thread's range; high limbs static here)
     uint64_t key64 = ((uint64_t)startKey_lo[1] << 32) | startKey_lo[0];
 
     // hash the seed (key = startKey)
-    affine_hash160(h160, &base);
     {
         long ki = localKeyBase;  // index 0 = seed
-        if (MODE == MODE_EMIT) {
-#pragma unroll
-            for (int b = 0; b < 20; b++) out[ki * 20 + b] = h160[b];
-        } else if (MODE == MODE_BENCH) {
-            uint8_t acc = 0;
-#pragma unroll
-            for (int b = 0; b < 20; b++) acc ^= h160[b];
-            sink[ki & 1023] = acc;
-        } else { // MODE_SCAN
-            int m = 1;
-#pragma unroll
-            for (int b = 0; b < 20; b++) if (h160[b] != target20[b]) m = 0;
-            if (m && atomicExch(found_flag, 1) == 0) {
-                uint64_t k = key64;
-                found_key[0] = (uint32_t)k; found_key[1] = (uint32_t)(k >> 32);
-#pragma unroll
-                for (int i = 2; i < 8; i++) found_key[i] = 0;  // small-key window
-            }
+        if (NEG) {
+            affine_hash160_negmap(h160, h160b, &base);
+            // for an n-k match the recorded low64 is the seed's k (host computes n-k); side=1
+            emit_or_match<MODE>(h160,  2 * ki + 0, key64, 0, out, sink, target20, found_key, found_flag, found_side);
+            emit_or_match<MODE>(h160b, 2 * ki + 1, key64, 1, out, sink, target20, found_key, found_flag, found_side);
+        } else {
+            affine_hash160(h160, &base);
+            emit_or_match<MODE>(h160, ki, key64, 0, out, sink, target20, found_key, found_flag, found_side);
         }
     }
 
@@ -116,26 +170,15 @@ __device__ void walk_thread(const affpt *table_s, affpt base, const uint32_t sta
             if (i == BATCH - 1) advance = R;
 
             // R is key = startKey + s*BATCH + (i+1)
-            affine_hash160(h160, &R);
             long ki = localKeyBase + (long)s * BATCH + (i + 1);
             uint64_t thisKey = key64 + (uint64_t)s * BATCH + (uint64_t)(i + 1);
-            if (MODE == MODE_EMIT) {
-#pragma unroll
-                for (int b = 0; b < 20; b++) out[ki * 20 + b] = h160[b];
-            } else if (MODE == MODE_BENCH) {
-                uint8_t acc = 0;
-#pragma unroll
-                for (int b = 0; b < 20; b++) acc ^= h160[b];
-                sink[ki & 1023] = acc;
-            } else { // MODE_SCAN
-                int m = 1;
-#pragma unroll
-                for (int b = 0; b < 20; b++) if (h160[b] != target20[b]) m = 0;
-                if (m && atomicExch(found_flag, 1) == 0) {
-                    found_key[0] = (uint32_t)thisKey; found_key[1] = (uint32_t)(thisKey >> 32);
-#pragma unroll
-                    for (int i2 = 2; i2 < 8; i2++) found_key[i2] = 0;
-                }
+            if (NEG) {
+                affine_hash160_negmap(h160, h160b, &R);
+                emit_or_match<MODE>(h160,  2 * ki + 0, thisKey, 0, out, sink, target20, found_key, found_flag, found_side);
+                emit_or_match<MODE>(h160b, 2 * ki + 1, thisKey, 1, out, sink, target20, found_key, found_flag, found_side);
+            } else {
+                affine_hash160(h160, &R);
+                emit_or_match<MODE>(h160, ki, thisKey, 0, out, sink, target20, found_key, found_flag, found_side);
             }
         }
         base = advance;  // next batch starts at key += BATCH
@@ -161,6 +204,7 @@ __global__ void kfast_seedhash(const affpt *seeds, uint8_t *out, int count) {
 }
 
 // ---- VERIFY kernel: single thread walks `keys` consecutive keys from `base0`, emits hash160s ----
+// In the NEGMAP build (NEG_DEFAULT==true) each point emits TWO hash160 (k at slot 2*ki, n-k at 2*ki+1).
 __global__ void kfast_verify(const affpt *table_g, affpt base0,
                              uint32_t start_lo0, uint32_t start_lo1,
                              int steps, uint8_t *out) {
@@ -168,7 +212,8 @@ __global__ void kfast_verify(const affpt *table_g, affpt base0,
     load_table_shared(table_s, table_g);
     if (threadIdx.x || blockIdx.x) return;
     uint32_t lo[2] = {start_lo0, start_lo1};
-    walk_thread<MODE_EMIT>(table_s, base0, lo, steps, out, nullptr, nullptr, nullptr, nullptr, 0);
+    walk_thread<MODE_EMIT, NEG_DEFAULT>(table_s, base0, lo, steps, out, nullptr, nullptr,
+                                        nullptr, nullptr, nullptr, 0);
 }
 
 // ---- BENCH kernel: each thread walks `steps` batches from its own contiguous start ----
@@ -179,21 +224,23 @@ __global__ void kfast_bench(const affpt *table_g, const affpt *bases,
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     affpt base = bases[tid];
     uint32_t lo[2] = {0u, 0u};  // key value irrelevant for bench
-    walk_thread<MODE_BENCH>(table_s, base, lo, steps, nullptr, sink, nullptr, nullptr, nullptr, 0);
+    walk_thread<MODE_BENCH, NEG_DEFAULT>(table_s, base, lo, steps, nullptr, sink, nullptr,
+                                         nullptr, nullptr, nullptr, 0);
 }
 
 // ---- SCAN kernel: each thread walks its window, compares to target ----
+// found_side: 0 if the target matched the key-k address, 1 if it matched the n-k (mirror) address.
 __global__ void kfast_scan(const affpt *table_g, const affpt *bases,
                            const uint32_t *base_keys_lo,  // 2 limbs per thread
                            int steps, const uint8_t *target20,
-                           uint32_t *found_key, int *found_flag) {
+                           uint32_t *found_key, int *found_flag, int *found_side) {
     extern __shared__ affpt table_s[];
     load_table_shared(table_s, table_g);
     int tid = blockIdx.x * blockDim.x + threadIdx.x;
     affpt base = bases[tid];
     uint32_t lo[2] = {base_keys_lo[tid * 2 + 0], base_keys_lo[tid * 2 + 1]};
-    walk_thread<MODE_SCAN>(table_s, base, lo, steps, nullptr, nullptr, target20,
-                           found_key, found_flag, 0);
+    walk_thread<MODE_SCAN, NEG_DEFAULT>(table_s, base, lo, steps, nullptr, nullptr, target20,
+                                        found_key, found_flag, found_side, 0);
 }
 
 // ======================= Host: scalar-mult seed via the VERIFIED Jacobian path =======================
@@ -383,6 +430,64 @@ static int mode_verify(const std::vector<Vector> &vecs) {
     return ok ? 0 : 1;
 }
 
+// ---- NEG-MAP verify: walk consecutive keys from START; assert BOTH parity hashes bit-exact ----
+// Reads a negmap oracle file (kat_oracle.py negmap START COUNT) with fields k_hex/h160_k_hex/
+// h160_negk_hex. The NEGMAP kfast_verify emits 2 slots per point: 2*i = key-k hash, 2*i+1 = n-k
+// hash. We compare both against the oracle, so this certifies the parity-byte flip AND the n-k
+// address derivation in one shot. Only meaningful in the -DNEGMAP binary (KEYS_PER_POINT==2).
+static int mode_negverify(const char *path) {
+    if (KEYS_PER_POINT != 2) {
+        printf("negverify requires the -DNEGMAP build (this binary covers 1 key/point)\n");
+        return 2;
+    }
+    std::string json = read_file(path);
+    auto ks    = extract_values(json, "k_hex");
+    auto hk    = extract_values(json, "h160_k_hex");
+    auto hnk   = extract_values(json, "h160_negk_hex");
+    int nkeys = (int)ks.size();
+    if (nkeys < 1 || hk.size() != (size_t)nkeys || hnk.size() != (size_t)nkeys) {
+        fprintf(stderr, "bad negmap file %s\n", path); return 1;
+    }
+    printf("(neg-map verify: %d consecutive keys from k=%s, hashing BOTH parities/point)\n",
+           nkeys, ks[0].c_str());
+
+    uint32_t start[8]; hex_to_limbs(ks[0], start);
+    std::vector<uint32_t> seedk(start, start + 8);
+    std::vector<affpt> seed; seed_affine(seedk, 1, seed);
+
+    int steps = (nkeys - 1 + BATCH - 1) / BATCH;
+    long pts = 1 + (long)steps * BATCH;
+    long cap = pts * 2;  // 2 hash160 slots per affine point in the NEGMAP build
+    affpt *d_table = build_table_device();
+    uint8_t *d_out; CUDA_CHECK(cudaMalloc(&d_out, cap * 20));
+    size_t shmem = (BATCH + 1) * sizeof(affpt);
+    kfast_verify<<<1, 64, shmem>>>(d_table, seed[0], start[0], start[1], steps, d_out);
+    CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
+
+    std::vector<uint8_t> h_out(cap * 20);
+    CUDA_CHECK(cudaMemcpy(h_out.data(), d_out, cap * 20, cudaMemcpyDeviceToHost));
+    cudaFree(d_out); cudaFree(d_table);
+
+    int ok = 1;
+    for (int i = 0; i < nkeys; i++) {
+        std::string gk  = bytes_to_hex(&h_out[(long)(2 * i + 0) * 20], 20);  // key-k hash
+        std::string gnk = bytes_to_hex(&h_out[(long)(2 * i + 1) * 20], 20);  // n-k mirror hash
+        bool pk = (gk == hk[i]), pnk = (gnk == hnk[i]);
+        if (!pk || !pnk) {
+            ok = 0;
+            printf("  neg[%d] FAIL  k:%s(%s)  n-k:%s(%s)\n", i,
+                   gk.c_str(),  pk  ? "ok" : ("!=" + hk[i]).c_str(),
+                   gnk.c_str(), pnk ? "ok" : ("!=" + hnk[i]).c_str());
+            if (i > 6) break;
+        } else if (i < 3 || i == nkeys - 1) {
+            printf("  neg[%d] PASS  k-hash=%s  n-k-hash=%s\n", i, gk.c_str(), gnk.c_str());
+        }
+    }
+    if (ok) printf("ALL %d NEG-MAP PAIRS PASS (both parities bit-exact)\n", nkeys);
+    else    printf("SOME NEG-MAP PAIRS FAILED\n");
+    return ok ? 0 : 1;
+}
+
 static int mode_scan(const std::vector<Vector> &vecs) {
     // target = vecs[0].hash160; one thread walks [priv-? .. ] covering priv. Use startKey = priv-? .
     // We seed a single thread at base = (priv - 5)·G and walk a small window so priv is inside.
@@ -406,28 +511,35 @@ static int mode_scan(const std::vector<Vector> &vecs) {
     CUDA_CHECK(cudaMemcpy(d_lo, lo, 2 * sizeof(uint32_t), cudaMemcpyHostToDevice));
     uint8_t *d_target; CUDA_CHECK(cudaMalloc(&d_target, 20));
     CUDA_CHECK(cudaMemcpy(d_target, target20, 20, cudaMemcpyHostToDevice));
-    uint32_t *d_fk; int *d_ff;
+    uint32_t *d_fk; int *d_ff; int *d_fs;
     CUDA_CHECK(cudaMalloc(&d_fk, 8 * sizeof(uint32_t))); CUDA_CHECK(cudaMalloc(&d_ff, sizeof(int)));
+    CUDA_CHECK(cudaMalloc(&d_fs, sizeof(int)));
     CUDA_CHECK(cudaMemset(d_ff, 0, sizeof(int))); CUDA_CHECK(cudaMemset(d_fk, 0, 8 * sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_fs, 0, sizeof(int)));
 
     size_t shmem = (BATCH + 1) * sizeof(affpt);
-    kfast_scan<<<1, 64, shmem>>>(d_table, d_bases, d_lo, steps, d_target, d_fk, d_ff);
+    kfast_scan<<<1, 64, shmem>>>(d_table, d_bases, d_lo, steps, d_target, d_fk, d_ff, d_fs);
     CUDA_CHECK(cudaGetLastError()); CUDA_CHECK(cudaDeviceSynchronize());
 
-    int ff = 0; uint32_t fk[8];
+    int ff = 0, fs = 0; uint32_t fk[8];
     CUDA_CHECK(cudaMemcpy(&ff, d_ff, sizeof(int), cudaMemcpyDeviceToHost));
+    CUDA_CHECK(cudaMemcpy(&fs, d_fs, sizeof(int), cudaMemcpyDeviceToHost));
     CUDA_CHECK(cudaMemcpy(fk, d_fk, 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    cudaFree(d_table); cudaFree(d_bases); cudaFree(d_lo); cudaFree(d_target); cudaFree(d_fk); cudaFree(d_ff);
+    cudaFree(d_table); cudaFree(d_bases); cudaFree(d_lo); cudaFree(d_target);
+    cudaFree(d_fk); cudaFree(d_ff); cudaFree(d_fs);
 
     uint64_t want = ((uint64_t)priv[1] << 32) | priv[0];
     uint64_t got = ((uint64_t)fk[1] << 32) | fk[0];
+    // side==0: matched the key-k address (the recorded low64 IS the key). side==1: matched the n-k
+    // (mirror) address; the recorded low64 is k, and the actual found key is n-k (host knows N).
     if (ff && got == want) {
-        printf("SCAN: FOUND key_lo=%016llx matches vector[0].priv low64 EXACTLY\n",
-               (unsigned long long)got);
+        printf("SCAN: FOUND key_lo=%016llx matches vector[0].priv low64 EXACTLY (side=%s)\n",
+               (unsigned long long)got, fs == 0 ? "k" : "n-k");
         return 0;
     }
-    printf("SCAN: %s (got_lo=%016llx want_lo=%016llx)\n",
-           ff ? "FOUND-BUT-MISMATCH" : "NOT FOUND", (unsigned long long)got, (unsigned long long)want);
+    printf("SCAN: %s (got_lo=%016llx want_lo=%016llx side=%d)\n",
+           ff ? "FOUND-BUT-MISMATCH" : "NOT FOUND",
+           (unsigned long long)got, (unsigned long long)want, fs);
     return 1;
 }
 
@@ -439,16 +551,21 @@ static int mode_bench(const std::vector<Vector> &vecs, uint64_t target_keys, int
     // steps to reach ~target_keys total
     long perThread = (long)((target_keys + nthreads - 1) / nthreads);
     int steps = (int)((perThread - 1 + BATCH - 1) / BATCH); if (steps < 1) steps = 1;
-    uint64_t keysPerThread = 1ull + (uint64_t)steps * BATCH;
-    uint64_t totalKeys = keysPerThread * (uint64_t)nthreads;
+    uint64_t pointsPerThread = 1ull + (uint64_t)steps * BATCH;       // affine points (EC adds) / thread
+    uint64_t totalPoints = pointsPerThread * (uint64_t)nthreads;
+    // HONEST A/B metric: addresses (candidate private keys) COVERED per second. Opt A covers 1 per
+    // affine point; Opt C (neg-map) covers KEYS_PER_POINT=2 (k and n-k) per point. So the throughput
+    // comparison is addresses/s = points/s * KEYS_PER_POINT — this is what makes a neg-map win (or
+    // its absence) visible: if hashing fully bottlenecks, points/s halves and addresses/s is flat.
+    uint64_t totalKeys = totalPoints * (uint64_t)KEYS_PER_POINT;
 
-    // seed each thread at a distinct contiguous start (= base + tid*keysPerThread). Use vecs[0].priv
+    // seed each thread at a distinct contiguous start (= base + tid*pointsPerThread). Use vecs[0].priv
     // as the global base; exact key values are irrelevant for throughput, only the work is.
     uint32_t base[8]; hex_to_limbs(vecs[0].priv_hex, base);
     std::vector<uint32_t> keys(nthreads * 8);
     for (int t = 0; t < nthreads; t++) {
         uint32_t k[8]; for (int i = 0; i < 8; i++) k[i] = base[i];
-        uint64_t add = (uint64_t)t * keysPerThread;
+        uint64_t add = (uint64_t)t * pointsPerThread;
         uint64_t s = (uint64_t)k[0] + (uint32_t)(add & 0xffffffffu); k[0]=(uint32_t)s; uint64_t c=s>>32;
         s = (uint64_t)k[1] + (uint32_t)(add>>32) + c; k[1]=(uint32_t)s; c=s>>32;
         for (int i = 2; i < 8; i++) { s=(uint64_t)k[i]+c; k[i]=(uint32_t)s; c=s>>32; }
@@ -483,8 +600,11 @@ static int mode_bench(const std::vector<Vector> &vecs, uint64_t target_keys, int
     std::sort(kps.begin(), kps.end());
     double median = kps[kps.size()/2];
     if (kps.size()%2==0) median = 0.5*(kps[kps.size()/2-1]+kps[kps.size()/2]);
-    printf("FAST BENCH: median %.0f keys/s over %d iters (BATCH=%d, steps=%d, %llu keys/iter)\n",
-           median, (int)kps.size(), BATCH, steps, (unsigned long long)totalKeys);
+    double pts_per_s = median / (double)KEYS_PER_POINT;
+    printf("FAST BENCH: median %.0f keys/s over %d iters (BATCH=%d, steps=%d, %llu keys/iter, "
+           "KEYS_PER_POINT=%d -> %.0f affine-points/s)\n",
+           median, (int)kps.size(), BATCH, steps, (unsigned long long)totalKeys,
+           KEYS_PER_POINT, pts_per_s);
     return 0;
 }
 
@@ -495,9 +615,18 @@ int main(int argc, char **argv) {
     // verify may take an explicit walk file as argv[2]
     if (mode == "verify" && argc > 2) vec_path = argv[2];
 
+    // negverify reads a negmap-format oracle file directly (k_hex / h160_k_hex / h160_negk_hex),
+    // not the standard priv/pub/h160 Vector schema, so handle it before the generic loader.
+    if (mode == "negverify") {
+        const char *np = (argc > 2) ? argv[2] : vec_path;
+        printf("BATCH=%d KEYS_PER_POINT=%d  negmap file=%s\n", BATCH, KEYS_PER_POINT, np);
+        return mode_negverify(np);
+    }
+
     std::vector<Vector> vecs = load_vectors(vec_path);
     if (vecs.empty()) { fprintf(stderr, "no vectors loaded from %s\n", vec_path); return 1; }
-    printf("Loaded %zu vectors from %s (BATCH=%d)\n", vecs.size(), vec_path, BATCH);
+    printf("Loaded %zu vectors from %s (BATCH=%d, KEYS_PER_POINT=%d)\n",
+           vecs.size(), vec_path, BATCH, KEYS_PER_POINT);
 
     int rc = 0;
     if (mode == "verify")      rc = mode_verify(vecs);

@@ -107,6 +107,49 @@ def walk(start: int, n: int) -> int:
     return 0
 
 
+def negmap(start: int, n: int) -> int:
+    """Emit n NEGATION-MAP vector pairs for keys start..start+n-1.
+
+    This is the bit-exact gate for Wave-3 Opt C (negation-map symmetry). For each key
+    k, the key n-k produces the point -P, which shares the SAME x-coordinate as P's
+    point and differs ONLY in the compressed-SEC parity prefix byte (02<->03, because
+    -y mod p = p-y flips parity when p is odd). So one affine x yields TWO candidate
+    private keys. Each emitted record carries:
+        k, n-k                                 (the two private keys)
+        pub_k_hex, pub_negk_hex                (compressed pubkeys; same x, flipped 02/03)
+        h160_k_hex, h160_negk_hex              (the two hash160s the kernel must produce)
+        x_hex                                  (the shared 32-byte x-coordinate, hex)
+    The kernel computes ONE affine point and hashes BOTH parity encodings; it must
+    reproduce h160_k_hex and h160_negk_hex bit-exact, and the two pubkeys must share x.
+    """
+    out = []
+    for i in range(n):
+        k = start + i
+        if k < 1 or k >= N:
+            raise SystemExit(f"key {k} out of [1, N) range")
+        nk = N - k  # the mirror key; for k in [1,N), n-k is also in [1,N)
+        pub_k = privkey_to_pubkey_compressed(k)
+        pub_nk = privkey_to_pubkey_compressed(nk)
+        # the shared x is bytes 1..33 of either compressed pubkey
+        x_k = pub_k[1:].hex()
+        x_nk = pub_nk[1:].hex()
+        if x_k != x_nk:
+            raise SystemExit(f"INVARIANT VIOLATED: k and n-k x mismatch at k={k}")
+        out.append({
+            "k_hex": f"{k:064x}",
+            "negk_hex": f"{nk:064x}",
+            "pub_k_hex": pub_k.hex(),
+            "pub_negk_hex": pub_nk.hex(),
+            "h160_k_hex": hash160(pub_k).hex(),
+            "h160_negk_hex": hash160(pub_nk).hex(),
+            "x_hex": x_k,
+            "parity_k": pub_k[0],     # 2 or 3
+            "parity_negk": pub_nk[0],
+        })
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def vectors(n: int) -> int:
     """Emit deterministic test vectors for kernel correctness tests (privkey, pubkey, hash160)."""
     out = []
@@ -138,6 +181,11 @@ if __name__ == "__main__":
         start = int(sys.argv[2], 0) if len(sys.argv) > 2 else 1
         cnt = int(sys.argv[3]) if len(sys.argv) > 3 else 16
         sys.exit(walk(start, cnt))
+    elif cmd == "negmap":
+        # negmap START N -> N negation-map pairs (k, n-k) from START (decimal or 0x-hex)
+        start = int(sys.argv[2], 0) if len(sys.argv) > 2 else 1
+        cnt = int(sys.argv[3]) if len(sys.argv) > 3 else 16
+        sys.exit(negmap(start, cnt))
     else:
         print(__doc__)
         sys.exit(2)
