@@ -13,3 +13,8 @@ venv/
 results/*.tmp
 *.log
 .DS_Store
+
+# compiled CUDA test binaries (no extension)
+kernels/cuda-ref/secp256k1_ref
+kernels/cuda-ref/*_ref
+kernels/cuda-ref/*_bench
