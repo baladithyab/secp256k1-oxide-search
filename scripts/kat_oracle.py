@@ -150,6 +150,37 @@ def negmap(start: int, n: int) -> int:
     return 0
 
 
+def kangaroo(bits: int, seed_hex: str = "0") -> int:
+    """Emit a bounded-interval ECDLP known-answer instance for the Track-D kangaroo solver.
+
+    Picks a DETERMINISTIC secret d in [2^bits, 2^(bits+1)) from `seed_hex` (so the kernel
+    test harness is reproducible), publishes Q = d*G (compressed), and emits the interval
+    bounds. The kangaroo solver is given ONLY (Q, lo, hi) and must recover d; the harness
+    checks the recovered d against `d_hex` bit-exact. This is the ground-truth gate for
+    Track D (Regime 2 / exposed-pubkey ECDLP) -- analogous to test_vectors.json for the
+    brute-force scanner, but for the discrete-log solver.
+
+    Emits one JSON object: { bits, lo_hex, hi_hex, d_hex, Q_compressed_hex }.
+    Use small bits (20-40) for a fast KAT the solver can crack in seconds.
+    """
+    lo = 1 << bits
+    hi = (1 << (bits + 1)) - 1
+    # deterministic d from seed (LCG-mixed so distinct seeds give distinct d in-range)
+    s = int(seed_hex, 0) if seed_hex else 0
+    s = (s * 6364136223846793005 + 1442695040888963407) & ((1 << 64) - 1)
+    d = lo + (s % (hi - lo))
+    Q = privkey_to_pubkey_compressed(d)
+    obj = {
+        "bits": bits,
+        "lo_hex": f"{lo:064x}",
+        "hi_hex": f"{hi:064x}",
+        "d_hex": f"{d:064x}",          # the ANSWER -- harness checks recovered d against this
+        "Q_compressed_hex": Q.hex(),   # the exposed public key the solver attacks
+    }
+    print(json.dumps(obj, indent=2))
+    return 0
+
+
 def vectors(n: int) -> int:
     """Emit deterministic test vectors for kernel correctness tests (privkey, pubkey, hash160)."""
     out = []
@@ -186,6 +217,11 @@ if __name__ == "__main__":
         start = int(sys.argv[2], 0) if len(sys.argv) > 2 else 1
         cnt = int(sys.argv[3]) if len(sys.argv) > 3 else 16
         sys.exit(negmap(start, cnt))
+    elif cmd == "kangaroo":
+        # kangaroo BITS [SEED] -> a bounded-interval ECDLP KAT (Q=d*G, d in [2^BITS, 2^(BITS+1)))
+        bits = int(sys.argv[2]) if len(sys.argv) > 2 else 32
+        seed = sys.argv[3] if len(sys.argv) > 3 else "0"
+        sys.exit(kangaroo(bits, seed))
     else:
         print(__doc__)
         sys.exit(2)
