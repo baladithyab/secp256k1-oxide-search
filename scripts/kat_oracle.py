@@ -83,6 +83,30 @@ def verify() -> int:
     return 0 if ok else 1
 
 
+def walk(start: int, n: int) -> int:
+    """Emit n CONSECUTIVE key vectors start..start+n-1 (priv, pubkey, hash160).
+
+    This is the bit-exact gate for the Wave-3 affine sequential walk: the fast kernel
+    advances by +G per key, so the oracle must validate that *every consecutive* key
+    derives the right hash160 (not just scattered random keys). Starting at small keys
+    (e.g. 1) deliberately drives the batched-inversion zero-denominator path.
+    """
+    out = []
+    for i in range(n):
+        priv = start + i
+        if priv < 1 or priv >= N:
+            raise SystemExit(f"key {priv} out of [1, N) range")
+        pub = privkey_to_pubkey_compressed(priv)
+        h160 = hash160(pub)
+        out.append({
+            "priv_hex": f"{priv:064x}",
+            "pub_compressed_hex": pub.hex(),
+            "hash160_hex": h160.hex(),
+        })
+    print(json.dumps(out, indent=2))
+    return 0
+
+
 def vectors(n: int) -> int:
     """Emit deterministic test vectors for kernel correctness tests (privkey, pubkey, hash160)."""
     out = []
@@ -109,6 +133,11 @@ if __name__ == "__main__":
         sys.exit(verify())
     elif cmd == "vectors":
         sys.exit(vectors(int(sys.argv[2]) if len(sys.argv) > 2 else 16))
+    elif cmd == "walk":
+        # walk START N  -> N consecutive key vectors from START (decimal or 0x-hex)
+        start = int(sys.argv[2], 0) if len(sys.argv) > 2 else 1
+        cnt = int(sys.argv[3]) if len(sys.argv) > 3 else 16
+        sys.exit(walk(start, cnt))
     else:
         print(__doc__)
         sys.exit(2)

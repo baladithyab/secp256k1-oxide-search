@@ -16,6 +16,8 @@ results/*.tmp
 
 # compiled CUDA test binaries (no extension)
 kernels/cuda-ref/secp256k1_ref
+kernels/cuda-ref/secp256k1_fast
+kernels/cuda-ref/secp256k1_fast_b*
 kernels/cuda-ref/*_ref
 kernels/cuda-ref/*_bench
 kernels/oxide-ec/target/
