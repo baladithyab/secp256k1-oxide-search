@@ -1,5 +1,41 @@
 # Wave 3 — Opt C (negation map) + hash160 throughput investigation (notes)
 
+> ## ⚠️ ERRATUM (post-merge cross-model review, opus-4.8 skeptical-crypto-reviewer)
+> A skeptical cryptography review of this file caught three errors. The EC math, the bit-exact
+> verification, the +20.7% measurement, and the Opt-A 98× are all CORRECT and stand. The
+> *interpretation* below was wrong in three places — corrected here; the original prose is left
+> intact below for the record.
+>
+> 1. **The "≈⅔ EC / ⅓ hash" balance label is INVERTED. The kernel is ≈⅔ HASH / ⅓ EC.** The correct
+>    serial model is `lift = 2/(1+b)` where `b` = hash time-fraction; measured lift 1.207 ⇒ **b ≈ 0.66**
+>    (hash), EC ≈ 0.34. Confirmed independently: a 285× EC-work reduction (2000→7 muls) yielding only
+>    98× overall *forces* hash to dominate the optimized kernel (E≈29.65 ns, H≈0.20 ns ⇒ hash fraction
+>    ≈ 0.66). The notes' own back-solve ("recoverable EC fraction e ≈ 0.34") literally says ⅓ EC — the
+>    prose label "⅔ EC" contradicts the file's own number. The `2/(2−e)` model on line ~53 is the
+>    wrong model; use `2/(1+b)`. **Opt A's original "hash-bound" guess was right; the Wave-3 SASS
+>    *static* instruction-count "correction" conflated static instruction mix with dynamic time
+>    fraction — they are not the same.**
+> 2. **For the BOUNDED #71 scan, neg-map is a NET LOSS, not a +20.7% gain.** When k∈[2⁷⁰,2⁷¹), the
+>    mirror n−k ≈ 2²⁵⁶ is out of range and can never be the puzzle answer, so the second hash tests a
+>    key that cannot win — pure wasted work. Useful-keys/s drops to 0.603× (**≈40% slower**). Neg-map
+>    should be **DISABLED for bounded-range puzzle scans.** The +20.7% is real ONLY for *unbounded /
+>    full-keyspace* search, where both k and n−k are valid targets. The original "its value is purely
+>    the throughput gain" (bottom of file) is backwards for the bounded case.
+> 3. **"GLV/endomorphism does NOT stack" is overstated.** By the SAME logic that makes neg-map work,
+>    φ(P)=(βx,y) and φ²(P) give extra candidate x-coords for ~1 mul each → the classic rho 6×
+>    coverage (±P, ±φP, ±φ²P) in UNBOUNDED search. n−k is "scattered" too, yet we exploited it. The
+>    honest statement: φ (and neg-map) stack in *full-keyspace* search; both fail in the *bounded*
+>    puzzle because the extra candidates fall out of range (same reason as #2). Claims 4 and 5 only
+>    cohere once you cleanly separate **unbounded** (neg-map & GLV both help) from **bounded #71**
+>    (neither helps; neg-map hurts).
+>
+> **Net corrected headline:** Opt A's 98× is the real, regime-independent win. Opt C's neg-map is a
+> +20.7% throughput gain for UNBOUNDED full-keyspace search and a ~40% LOSS for the bounded #71 scan
+> (disable it there). The affine walk is ≈⅔ hash-bound, so further EC-only tricks yield little either
+> way. None of this changes the negative-EV verdict.
+
+---
+
 Builds on `wave3-fastpath-notes.md` (Opt A: affine +G walk + batched Montgomery inversion, 98×,
 BATCH=256). Same hardware/toolchain: RTX 5090 (sm_120), `/usr/local/cuda/bin/nvcc -ccbin clang-14
 -O3 -arch=sm_120`, median over 12 iters, GPU idle at session start. All variants stay **bit-exact**
