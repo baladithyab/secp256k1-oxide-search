@@ -1,0 +1,2 @@
+optimization,baseline_keys_per_sec,optimized_keys_per_sec,lift_x,batch,iters,keys_per_iter,gpu_thermal_before,gpu_thermal_after,notes
+opt_a_batched_montgomery_inversion,33497444,3283058620,98.0,256,12,67371008,"43C, 39.58W, 5%","57C, 312.47W, 99%","affine +G walk; 1 modinv + ~3N modmul per batch of 256; baseline re-run same session on idle GPU; bit-exact ALL 200/1100 walk vectors + adversarial doubling+infinity lanes"
