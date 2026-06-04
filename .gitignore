@@ -1,0 +1,15 @@
+target/
+**/target/
+Cargo.lock
+*.ptx
+*.ll
+*.cubin
+*.sass
+__pycache__/
+*.pyc
+.venv/
+venv/
+.pixi/
+results/*.tmp
+*.log
+.DS_Store
