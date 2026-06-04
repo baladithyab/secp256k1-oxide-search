@@ -202,6 +202,76 @@ __global__ void k_walk(affpt *px, uint64_t *dist, uint32_t M_t, uint32_t M_w,
     dist[g] = D;
 }
 
+// ----- batched-inversion walk (fast path) ----------------------------------
+// Each THREAD owns B kangaroos (B = WALK_B). One Fermat inverse + ~3B muls inverts all B step
+// denominators (Montgomery's trick), collapsing the per-kangaroo inverse cost from ~270 muls to
+// ~270/B + 2. This is the dominant throughput lever (the per-step k_walk pays a full inverse/step).
+//
+// Layout: thread t owns kangaroos [t*B, t*B+B). The same global px[]/dist[] arrays are used; we just
+// stride by B per thread. Each kangaroo keeps its own type (tame if global index < M_t).
+// All field math reuses the BIT-EXACT primitives (aff_add_with_inv / aff_add_fallback / fe_inv).
+#ifndef WALK_B
+#define WALK_B 32   // kangaroos per thread for batched inversion. Swept 8/16/32/64 on RTX 5090:
+#endif              // throughput 0.56/0.91/1.05/0.43 G jumps/s — 32 is the occupancy sweet spot
+                    // (64 spills the per-thread affpt[B]+pre[B+1] frame to local mem). See notes.
+__global__ void k_walk_batch(affpt *px, uint64_t *dist, uint32_t M_t, uint32_t M_w,
+                             int steps, uint32_t dp_mask,
+                             uint32_t *dp_x, uint64_t *dp_dist, uint8_t *dp_type, uint32_t cap) {
+    const int B = WALK_B;
+    uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t base = t * B;
+    uint32_t M = M_t + M_w;
+    if (base >= M) return;
+    int nb = B; if (base + nb > M) nb = M - base;   // tail thread may own < B kangaroos
+
+    affpt P[WALK_B];
+    uint64_t D[WALK_B];
+    uint32_t idx[WALK_B];
+#pragma unroll
+    for (int i = 0; i < WALK_B; i++) if (i < nb) { P[i] = px[base + i]; D[i] = dist[base + i]; }
+
+    for (int s = 0; s < steps; s++) {
+        // forward pass: jump index per kangaroo, denominator dd[i] = J[idx].x - P[i].x, prefix products
+        fe dd[WALK_B];
+        fe pre[WALK_B + 1];           // pre[0]=1, pre[i+1]=pre[i]*dd[i] (zeros substituted by 1)
+        uint8_t zero[WALK_B];
+        fe_set_zero(&pre[0]); pre[0].v[0] = 1u;
+        for (int i = 0; i < nb; i++) {
+            idx[i] = P[i].x.v[0] & (K_JUMPS - 1);
+            fe_sub(&dd[i], &d_jump[idx[i]].x, &P[i].x);
+            if (fe_is_zero(&dd[i])) { zero[i] = 1u; fe_copy(&pre[i + 1], &pre[i]); }
+            else                    { zero[i] = 0u; fe_mul(&pre[i + 1], &pre[i], &dd[i]); }
+        }
+        fe u; fe_inv(&u, &pre[nb]);    // 1 / (product of all NONZERO denominators)
+        // backward pass: inv(dd[i]) = u * pre[i]; then strip: u *= dd[i]
+        for (int i = nb - 1; i >= 0; i--) {
+            if (zero[i]) {
+                aff_add_fallback(&P[i], &P[i], &d_jump[idx[i]]);   // P==±J (rare), u unchanged
+            } else {
+                fe inv_i; fe_mul(&inv_i, &u, &pre[i]);
+                affpt R; aff_add_with_inv(&R, &P[i], &d_jump[idx[i]], &inv_i);
+                P[i] = R;
+                fe nu; fe_mul(&nu, &u, &dd[i]); fe_copy(&u, &nu);
+            }
+            D[i] += d_jumpscalar[idx[i]];
+        }
+        // DP check for all kangaroos in the batch
+        for (int i = 0; i < nb; i++) {
+            if ((P[i].x.v[0] & dp_mask) == 0u) {
+                uint32_t at = atomicAdd(&d_dpcount, 1u);
+                if (at < cap) {
+#pragma unroll
+                    for (int l = 0; l < 8; l++) dp_x[at * 8 + l] = P[i].x.v[l];
+                    dp_dist[at] = D[i];
+                    dp_type[at] = (base + i < M_t) ? 0u : 1u;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < WALK_B; i++) if (i < nb) { px[base + i] = P[i]; dist[base + i] = D[i]; }
+}
+
 // ----- final verification kernel -------------------------------------------
 // Confirm cand*G == Q (compressed) bit-exact before the host prints the answer.
 __global__ void k_verify(uint64_t cand, const uint8_t *Q_comp, int *ok) {
@@ -270,25 +340,46 @@ int main(int argc, char **argv) {
     uint64_t sqrtW = isqrt_u64(W);
 
     // ---- parameters (env-overridable for tuning / scaling experiments) ----
-    long herd = env_long("KANG_HERD", 1L << 16);
+    // Herd is PER SIDE (M_t tame + M_w wild). Two regimes:
+    //   * scaling measurement: a MODEST herd with M << sqrtW keeps us in the linear-speedup
+    //     regime (total jumps ~ c*sqrt(W), independent of M) so the sqrt(n) law is cleanly
+    //     visible; KANG_HERD picks it.
+    //   * peak throughput: a LARGE herd saturates the GPU (set KANG_HERD high on a big interval).
+    long herd = env_long("KANG_HERD", 1L << 14);
     uint32_t M_t = (uint32_t)herd; if ((uint64_t)M_t > sqrtW + 1) M_t = (uint32_t)(sqrtW + 1);
     if (M_t < 64) M_t = 64;
     uint32_t M_w = M_t;
     uint32_t M = M_t + M_w;
     uint64_t mean = env_long("KANG_MEAN", 0);
     if (mean == 0) mean = sqrtW / 2; if (mean < 1) mean = 1;
-    int steps_per_round = (int)env_long("KANG_STEPS", 1024);
-    // DP bits: keep (M * 2^dp)/sqrtW small (~1/8). dp = floor(log2(sqrtW/(8*M))), clamped >= 0.
+
+    // DP bits: total stored DPs ~ (c*sqrt(W))/2^dp; keep it ~<= 2^20 so the host tables and the
+    // per-round report buffer never overflow. bitlen(sqrtW)-18 gives dp=0 for tiny intervals
+    // (store-everything, instant) and grows ~1 bit per +2 interval bits at scale.
+    int sqrtW_bits = 0; { uint64_t t = sqrtW; while (t) { sqrtW_bits++; t >>= 1; } }
     long dp_override = env_long("KANG_DP", -1);
-    int dp_bits;
-    if (dp_override >= 0) dp_bits = (int)dp_override;
-    else { double r = (double)sqrtW / (8.0 * (double)M); dp_bits = (r >= 1.0) ? (int)floor(log2(r)) : 0; }
+    int dp_bits = (dp_override >= 0) ? (int)dp_override : (sqrtW_bits > 18 ? sqrtW_bits - 18 : 0);
     if (dp_bits > 31) dp_bits = 31;
     uint32_t dp_mask = (dp_bits >= 32) ? 0xFFFFFFFFu : ((1u << dp_bits) - 1u);
+    uint64_t dp_period = 1ull << dp_bits;  // expected jumps between DPs per kangaroo
 
-    // per-kangaroo step budget: generous multiple of expected 2*sqrtW/M_t
+    // Expected per-kangaroo steps to solve ~ c*sqrt(W)/M (+ DP overshoot 2^dp). Use c=8 (loose
+    // upper bound for this herd layout) to size rounds and budget so we never false-fail.
+    uint64_t est_per_kang = 8 * (sqrtW / (M ? M : 1)) + dp_period + 1;
+
+    // steps_per_round: aim for ~16-64 rounds (fine granularity for the scaling curve) while
+    // bounding the per-round DP buffer: M*steps/2^dp <= cap.
+    uint64_t buf_cap_steps = ((uint64_t)KANG_CAP * dp_period) / (M ? M : 1);
+    long steps_override = env_long("KANG_STEPS", -1);
+    uint64_t steps_per_round_u = (steps_override > 0) ? (uint64_t)steps_override : (est_per_kang / 16 + 1);
+    if (steps_per_round_u < 64) steps_per_round_u = 64;
+    if (steps_per_round_u > buf_cap_steps && buf_cap_steps > 0) steps_per_round_u = buf_cap_steps;
+    if (steps_per_round_u < 1) steps_per_round_u = 1;
+    int steps_per_round = (int)steps_per_round_u;
+
+    // per-kangaroo step budget: 32x the estimate (generous) so a slow-tail run still completes.
     uint64_t budget = (uint64_t)env_long("KANG_BUDGET", 0);
-    if (budget == 0) budget = 64 * (sqrtW / (M_t ? M_t : 1) + 1) + 200000;
+    if (budget == 0) budget = 32 * est_per_kang + 200000;
 
     fprintf(stderr, "[kangaroo] W=2^%.1f sqrtW=%llu M=%u (t=%u,w=%u) mean=%llu dp_bits=%d steps/round=%d budget=%llu\n",
             log2((double)W), (unsigned long long)sqrtW, M, M_t, M_w,
@@ -340,11 +431,23 @@ int main(int argc, char **argv) {
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0);
 
+    // walk kernel selection: KANG_BATCH=1 (default) uses the batched-inversion fast path;
+    // KANG_BATCH=0 uses the per-step-inverse k_walk (kept for A/B and as the simple reference).
+    int use_batch = (int)env_long("KANG_BATCH", 1);
+    int walk_b = WALK_B;
+    int blocks_batch = (int)(((uint64_t)M + (uint64_t)threads * walk_b - 1) / ((uint64_t)threads * walk_b));
+    fprintf(stderr, "[kangaroo] walk=%s B=%d\n",
+            use_batch ? "batched-inversion" : "per-step-inverse", use_batch ? walk_b : 1);
+
     uint64_t found_cand = 0; int solved = 0;
     while (total_steps < budget && !solved) {
         uint32_t zero = 0; CUDA_OK(cudaMemcpyToSymbol(d_dpcount, &zero, sizeof(uint32_t)));
-        k_walk<<<blocks, threads>>>(d_px, d_dist, M_t, M_w, steps_per_round, dp_mask,
-                                    d_dpx, d_dpdist, d_dptype, cap);
+        if (use_batch)
+            k_walk_batch<<<blocks_batch, threads>>>(d_px, d_dist, M_t, M_w, steps_per_round, dp_mask,
+                                                    d_dpx, d_dpdist, d_dptype, cap);
+        else
+            k_walk<<<blocks, threads>>>(d_px, d_dist, M_t, M_w, steps_per_round, dp_mask,
+                                        d_dpx, d_dpdist, d_dptype, cap);
         CUDA_OK(cudaDeviceSynchronize());
         total_steps += steps_per_round;
 
