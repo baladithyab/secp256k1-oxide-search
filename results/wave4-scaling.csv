@@ -1,0 +1,5 @@
+"# Wave-4 orchestrator scaling: pure-Python CPU stub kernel (NOT a GPU keys/s number); toy keyspace [0,30000) block=500; aggregate_keys_s = total_keys / wall-to-exhaustion"
+workers,total_keys,wall_s,aggregate_keys_s,speedup_vs_1
+1,30000,2.7236,11014.7,1.000
+2,30000,1.3701,21896.3,1.988
+4,30000,0.7175,41808.9,3.796

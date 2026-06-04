@@ -1,0 +1,7 @@
+metric,value,unit
+median_keys_per_sec,33139489,keys/s
+iterations,12,count
+keys_per_iter,1048576,count
+min_keys_per_sec,31579020,keys/s
+max_keys_per_sec,34076999,keys/s
+gpu_thermal_context,"65, 220.36 W, 100 %"
