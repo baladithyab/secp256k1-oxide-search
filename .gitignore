@@ -18,3 +18,4 @@ results/*.tmp
 kernels/cuda-ref/secp256k1_ref
 kernels/cuda-ref/*_ref
 kernels/cuda-ref/*_bench
+kernels/oxide-ec/target/

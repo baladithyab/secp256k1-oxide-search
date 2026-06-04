@@ -1,0 +1,13 @@
+metric,value,unit
+median_keys_per_sec,286907,keys/s
+min_keys_per_sec,282597,keys/s
+max_keys_per_sec,293451,keys/s
+iterations,12,count
+keys_per_iter,1048576,count
+timing_method,host_wall_clock_Instant,note
+target_arch,sm_120,sass_verified
+bench_kernel_registers,168,count
+bench_kernel_stack_bytes,2504,bytes
+bench_kernel_ldl_stl_localmem_ops,1675,count
+all_vectors_pass,true,8_canonical+32_fresh_bit_exact
+gpu_thermal_context,"47, 47.82 W, 15 %",temp_power_util

@@ -1,0 +1,20 @@
+[package]
+name = "oxide-ec"
+version = "0.1.0"
+edition = "2021"
+default-run = "oxide-ec"
+
+[workspace]
+
+[[bin]]
+name = "oxide-ec"
+path = "src/main.rs"
+
+# NOTE: pinned to rev 2a03dfd. cuda-oxide HEAD (c21cd1ae, 131 commits newer) regressed
+# index_1d codegen: even a minimal vecadd fails PTX verification with
+# "MirConstructStructOp result must be a struct type" inside cuda_device::__internal::index_1d.
+# 2a03dfd is the latest commit whose examples build+run on sm_120 here. See wave2-oxide-notes.md.
+[dependencies]
+cuda-device = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2a03dfd" }
+cuda-host = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2a03dfd" }
+cuda-core = { git = "https://github.com/NVlabs/cuda-oxide.git", rev = "2a03dfd" }

@@ -1,7 +1,7 @@
 metric,value,unit
-median_keys_per_sec,33282094,keys/s
+median_keys_per_sec,33139489,keys/s
 iterations,12,count
 keys_per_iter,1048576,count
-min_keys_per_sec,32731833,keys/s
-max_keys_per_sec,33422139,keys/s
-gpu_thermal_context,"57, 225.25 W, 100 %"
+min_keys_per_sec,31579020,keys/s
+max_keys_per_sec,34076999,keys/s
+gpu_thermal_context,"65, 220.36 W, 100 %"
