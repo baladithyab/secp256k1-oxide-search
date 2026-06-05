@@ -23,3 +23,8 @@ kernels/cuda-ref/secp256k1_negmap_b*
 kernels/cuda-ref/*_ref
 kernels/cuda-ref/*_bench
 kernels/oxide-ec/target/
+
+# compiled Track-D kangaroo binaries (no extension)
+kernels/kangaroo/kangaroo
+kernels/kangaroo/kangaroo_negmap
+kernels/kangaroo/kangaroo_b*
