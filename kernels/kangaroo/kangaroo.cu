@@ -49,6 +49,15 @@ __device__ affpt   d_jump[K_JUMPS];     // jump points J[i] = s[i]*G (affine)
 __device__ uint64_t d_jumpscalar[K_JUMPS]; // s[i] (kept on device so the walk accumulates distance)
 __device__ affpt   d_Qp;                // shifted target Q' = Q - lo*G (affine)
 __device__ uint32_t d_dpcount;          // atomic DP write index for the current round
+__device__ unsigned long long d_escapes; // negmap diagnostic: count of fruitless-cycle escapes fired
+
+// ----- field helper: negate mod p (y -> p - y), used by the negation map ----
+__device__ __forceinline__ void fe_negate(fe *r, const fe *a) {
+    fe feP;
+#pragma unroll
+    for (int i = 0; i < 8; i++) feP.v[i] = P_LIMBS[i];
+    fe_sub(r, &feP, a);   // p - a (a in [1,p) => result in (0,p]; a=0 maps to 0 but never occurs for y)
+}
 
 // ----- new field helper: modular square root ------------------------------
 __device__ void fe_sqrt(fe *r, const fe *a) {        // r = a^((p+1)/4) mod p
@@ -162,6 +171,45 @@ __global__ void k_init_kangaroos(affpt *px, uint64_t *dist, uint32_t M_t, uint32
     }
 }
 
+// Negation-map init: same start layout, but canonicalize each start to (x, even-y) and record the
+// SIGNED dlog-state. dlog(start) for tame = +scalar (a=0), for wild = d' (a=+1). Canonicalizing a
+// start with odd y negates it: dlog -> -dlog, so w -> -w and a -> -a.
+//   tame: a=0 always; if start negated, w = -start.
+//   wild: a = +1 normally, -1 if Q'+off*G had odd y; w = (negated ? -off : off).
+__global__ void k_init_kangaroos_negmap(affpt *px, int64_t *dist, int8_t *sgn,
+                                       uint32_t M_t, uint32_t M_w,
+                                       uint64_t stride_t, uint64_t stride_w) {
+    uint32_t g = blockIdx.x * blockDim.x + threadIdx.x;
+    if (g >= M_t + M_w) return;
+    affpt S; int64_t w; int a;
+    if (g < M_t) {
+        uint64_t start = stride_t / 2 + (uint64_t)g * stride_t;
+        if (start == 0) start = 1;
+        affine_scalar_mul_G(&S, start);
+        a = 0; w = (int64_t)start;
+    } else {
+        uint32_t j = g - M_t;
+        uint64_t off = stride_w / 2 + (uint64_t)j * stride_w;
+        jpoint jQp; fe_copy(&jQp.X, &d_Qp.x); fe_copy(&jQp.Y, &d_Qp.y); fe_set_zero(&jQp.Z); jQp.Z.v[0] = 1u;
+        if (off == 0) { fe_copy(&S.x, &d_Qp.x); fe_copy(&S.y, &d_Qp.y); }
+        else {
+            affpt offG; affine_scalar_mul_G(&offG, off);
+            jpoint joff; fe_copy(&joff.X, &offG.x); fe_copy(&joff.Y, &offG.y); fe_set_zero(&joff.Z); joff.Z.v[0] = 1u;
+            jpoint jr; jpoint_add(&jr, &jQp, &joff);
+            fe ax, ay; jpoint_to_affine(&ax, &ay, &jr);
+            fe_copy(&S.x, &ax); fe_copy(&S.y, &ay);
+        }
+        a = 1; w = (int64_t)off;
+    }
+    // canonicalize: if odd y, negate point and flip the signed state
+    if (fe_is_odd(&S.y)) {
+        fe ny; fe_negate(&ny, &S.y); fe_copy(&S.y, &ny);
+        w = -w; a = -a;
+    }
+    fe_copy(&px[g].x, &S.x); fe_copy(&px[g].y, &S.y);
+    dist[g] = w; sgn[g] = (int8_t)a;
+}
+
 // ----- the walk ------------------------------------------------------------
 // Each thread advances its kangaroo `steps` times. On a distinguished point (x has dp_bits trailing
 // zero bits) it appends a DP record {x[8], dist, type} to the report buffer. State persists in global
@@ -270,6 +318,93 @@ __global__ void k_walk_batch(affpt *px, uint64_t *dist, uint32_t M_t, uint32_t M
     }
 #pragma unroll
     for (int i = 0; i < WALK_B; i++) if (i < nb) { px[base + i] = P[i]; dist[base + i] = D[i]; }
+}
+
+// ----- negation-map walk (batched inversion + canonicalization) ------------
+// The negation map folds {P,-P} onto the canonical rep (x, EVEN-y), shrinking the walk space ~2x
+// (~sqrt(2) fewer jumps). Bookkeeping (proven in kangaroo_negmap_ref.py): each kangaroo carries a
+// SIGNED dlog-state dlog(C) = a*d' + w, a in {0 (tame), +-1 (wild)}, w a signed int64 (never reduced
+// mod n — stays << sqrt(W) << n). A step C -> canon(C + J[idx]) with canon-sign eps in {+1,-1} maps
+//   (a, w) -> (eps*a, eps*(w + s_idx)).
+// Fruitless-cycle fix: a 2-cycle (the dominant hazard, ~1/(2K)/step) is detected by x == x_2-ago and
+// escaped with the ALTERNATE jump idx^1 — a PURE FUNCTION of the point, so two kangaroos sharing the
+// cycle pick the same alternate and MERGE (preserving the collision property). At GPU scale (32+ bit)
+// the tiny-space false-firing that hurt the serial reference cannot occur.
+// Distances are int64_t here; sgn[] holds a in {+1 wild, -1 wild-negated, 0 tame} packed as int8.
+__global__ void k_walk_negmap(affpt *px, int64_t *dist, int8_t *sgn, uint32_t M_t, uint32_t M_w,
+                             int steps, uint32_t dp_mask,
+                             uint32_t *dp_x, int64_t *dp_dist, int8_t *dp_sgn, uint8_t *dp_type,
+                             uint32_t cap) {
+    const int B = WALK_B;
+    uint32_t t = blockIdx.x * blockDim.x + threadIdx.x;
+    uint32_t base = t * B;
+    uint32_t M = M_t + M_w;
+    if (base >= M) return;
+    int nb = B; if (base + nb > M) nb = M - base;
+
+    affpt P[WALK_B];
+    int64_t D[WALK_B];
+    int8_t  A[WALK_B];
+    uint32_t prev2[WALK_B];          // low-limb x from two steps ago (cycle detection)
+    uint32_t prev1[WALK_B];
+    uint32_t idx[WALK_B];
+#pragma unroll
+    for (int i = 0; i < WALK_B; i++) if (i < nb) {
+        P[i] = px[base + i]; D[i] = dist[base + i]; A[i] = sgn[base + i];
+        prev2[i] = 0xFFFFFFFFu; prev1[i] = 0xFFFFFFFFu;
+    }
+
+    for (int s = 0; s < steps; s++) {
+        fe dd[WALK_B];
+        fe pre[WALK_B + 1];
+        uint8_t zero[WALK_B];
+        fe_set_zero(&pre[0]); pre[0].v[0] = 1u;
+        for (int i = 0; i < nb; i++) {
+            uint32_t curx = P[i].x.v[0];
+            idx[i] = curx & (K_JUMPS - 1);
+            if (curx == prev2[i]) { idx[i] ^= 1u; atomicAdd(&d_escapes, 1ull); }  // 2-cycle escape
+            fe_sub(&dd[i], &d_jump[idx[i]].x, &P[i].x);
+            if (fe_is_zero(&dd[i])) { zero[i] = 1u; fe_copy(&pre[i + 1], &pre[i]); }
+            else                    { zero[i] = 0u; fe_mul(&pre[i + 1], &pre[i], &dd[i]); }
+        }
+        fe u; fe_inv(&u, &pre[nb]);
+        for (int i = nb - 1; i >= 0; i--) {
+            affpt R;
+            if (zero[i]) {
+                aff_add_fallback(&R, &P[i], &d_jump[idx[i]]);
+            } else {
+                fe inv_i; fe_mul(&inv_i, &u, &pre[i]);
+                aff_add_with_inv(&R, &P[i], &d_jump[idx[i]], &inv_i);
+                fe nu; fe_mul(&nu, &u, &dd[i]); fe_copy(&u, &nu);
+            }
+            // canonicalize R to (x, even-y); eps = -1 if we negated
+            int eps = 1;
+            if (fe_is_odd(&R.y)) { fe ny; fe_negate(&ny, &R.y); fe_copy(&R.y, &ny); eps = -1; }
+            // update signed dlog-state: (a,w) -> (eps*a, eps*(w + s_idx))
+            int64_t s_idx = (int64_t)d_jumpscalar[idx[i]];
+            D[i] = (eps < 0) ? -(D[i] + s_idx) : (D[i] + s_idx);
+            A[i] = (int8_t)(eps * (int)A[i]);
+            // shift cycle-detection history
+            prev2[i] = prev1[i]; prev1[i] = P[i].x.v[0];
+            P[i] = R;
+        }
+        for (int i = 0; i < nb; i++) {
+            if ((P[i].x.v[0] & dp_mask) == 0u) {
+                uint32_t at = atomicAdd(&d_dpcount, 1u);
+                if (at < cap) {
+#pragma unroll
+                    for (int l = 0; l < 8; l++) dp_x[at * 8 + l] = P[i].x.v[l];
+                    dp_dist[at] = D[i];
+                    dp_sgn[at]  = A[i];
+                    dp_type[at] = (base + i < M_t) ? 0u : 1u;
+                }
+            }
+        }
+    }
+#pragma unroll
+    for (int i = 0; i < WALK_B; i++) if (i < nb) {
+        px[base + i] = P[i]; dist[base + i] = D[i]; sgn[base + i] = A[i];
+    }
 }
 
 // ----- final verification kernel -------------------------------------------
@@ -404,13 +539,20 @@ int main(int argc, char **argv) {
     CUDA_OK(cudaMemcpy(d_jscal, jscal, K_JUMPS * 8, cudaMemcpyHostToDevice));
 
     affpt *d_px; CUDA_OK(cudaMalloc(&d_px, (size_t)M * sizeof(affpt)));
-    uint64_t *d_dist; CUDA_OK(cudaMalloc(&d_dist, (size_t)M * sizeof(uint64_t)));
 
     uint32_t cap = KANG_CAP;
     uint32_t *d_dpx; CUDA_OK(cudaMalloc(&d_dpx, (size_t)cap * 8 * sizeof(uint32_t)));
-    uint64_t *d_dpdist; CUDA_OK(cudaMalloc(&d_dpdist, (size_t)cap * sizeof(uint64_t)));
     uint8_t *d_dptype; CUDA_OK(cudaMalloc(&d_dptype, (size_t)cap * sizeof(uint8_t)));
     int *d_ok; CUDA_OK(cudaMalloc(&d_ok, sizeof(int)));
+#ifdef NEGMAP
+    int64_t *d_dist; CUDA_OK(cudaMalloc(&d_dist, (size_t)M * sizeof(int64_t)));
+    int8_t  *d_sgn;  CUDA_OK(cudaMalloc(&d_sgn,  (size_t)M * sizeof(int8_t)));
+    int64_t *d_dpdist; CUDA_OK(cudaMalloc(&d_dpdist, (size_t)cap * sizeof(int64_t)));
+    int8_t  *d_dpsgn;  CUDA_OK(cudaMalloc(&d_dpsgn,  (size_t)cap * sizeof(int8_t)));
+#else
+    uint64_t *d_dist; CUDA_OK(cudaMalloc(&d_dist, (size_t)M * sizeof(uint64_t)));
+    uint64_t *d_dpdist; CUDA_OK(cudaMalloc(&d_dpdist, (size_t)cap * sizeof(uint64_t)));
+#endif
 
     // ---- setup ----
     k_init_global<<<1, 1>>>(d_Q, d_neglo, d_jscal);
@@ -418,36 +560,69 @@ int main(int argc, char **argv) {
     uint64_t stride_t = W / M_t; if (stride_t < 1) stride_t = 1;
     uint64_t stride_w = W / M_w; if (stride_w < 1) stride_w = 1;
     int threads = 256, blocks = (M + threads - 1) / threads;
+#ifdef NEGMAP
+    k_init_kangaroos_negmap<<<blocks, threads>>>(d_px, d_dist, d_sgn, M_t, M_w, stride_t, stride_w);
+#else
     k_init_kangaroos<<<blocks, threads>>>(d_px, d_dist, M_t, M_w, stride_t, stride_w);
+#endif
     CUDA_OK(cudaDeviceSynchronize());
 
     // ---- host DP tables (accumulate across rounds) ----
-    std::unordered_map<std::string, uint64_t> tame_map, wild_map;
+    // Tame stores (a,w)=(0,m); wild stores (a,w), a in {+-1}. Collision at same canonical x:
+    //   a_t*d'+w_t = a_w*d'+w_w  => d' = (w_w-w_t)/(a_t-a_w). For the base path (no NEGMAP) tame a=0,
+    //   wild a=+1 => d' = w_t - w_w = T - D, identical to the original solver.
+    struct DPVal { int64_t w; int8_t a; };
+    std::unordered_map<std::string, DPVal> tame_map, wild_map;
     std::vector<uint32_t> hx((size_t)cap * 8);
-    std::vector<uint64_t> hdist(cap);
     std::vector<uint8_t> htype(cap);
+#ifdef NEGMAP
+    std::vector<int64_t> hdist(cap);
+    std::vector<int8_t>  hsgn(cap);
+#else
+    std::vector<uint64_t> hdist(cap);
+#endif
 
     uint64_t total_steps = 0;
     cudaEvent_t t0, t1; cudaEventCreate(&t0); cudaEventCreate(&t1);
     cudaEventRecord(t0);
 
-    // walk kernel selection: KANG_BATCH=1 (default) uses the batched-inversion fast path;
-    // KANG_BATCH=0 uses the per-step-inverse k_walk (kept for A/B and as the simple reference).
-    int use_batch = (int)env_long("KANG_BATCH", 1);
     int walk_b = WALK_B;
     int blocks_batch = (int)(((uint64_t)M + (uint64_t)threads * walk_b - 1) / ((uint64_t)threads * walk_b));
+#ifdef NEGMAP
+    fprintf(stderr, "[kangaroo] walk=negation-map (batched-inversion B=%d)\n", walk_b);
+#else
+    // walk kernel selection: KANG_BATCH=1 (default) batched-inversion; 0 = per-step-inverse (A/B).
+    int use_batch = (int)env_long("KANG_BATCH", 1);
     fprintf(stderr, "[kangaroo] walk=%s B=%d\n",
             use_batch ? "batched-inversion" : "per-step-inverse", use_batch ? walk_b : 1);
+#endif
 
     uint64_t found_cand = 0; int solved = 0;
+    auto try_pair = [&](int8_t a_t, int64_t w_t, int8_t a_w, int64_t w_w) -> int {
+        int da = (int)a_t - (int)a_w;
+        if (da == 0) return 0;
+        int64_t num = w_w - w_t;
+        if (num % da != 0) return 0;
+        int64_t dprime = num / da;
+        if (dprime < 0) return 0;
+        uint64_t cand = lo + (uint64_t)dprime;
+        if (cand >= lo && cand <= hi) { found_cand = cand; return 1; }
+        return 0;
+    };
+
     while (total_steps < budget && !solved) {
         uint32_t zero = 0; CUDA_OK(cudaMemcpyToSymbol(d_dpcount, &zero, sizeof(uint32_t)));
+#ifdef NEGMAP
+        k_walk_negmap<<<blocks_batch, threads>>>(d_px, d_dist, d_sgn, M_t, M_w, steps_per_round,
+                                                 dp_mask, d_dpx, d_dpdist, d_dpsgn, d_dptype, cap);
+#else
         if (use_batch)
             k_walk_batch<<<blocks_batch, threads>>>(d_px, d_dist, M_t, M_w, steps_per_round, dp_mask,
                                                     d_dpx, d_dpdist, d_dptype, cap);
         else
             k_walk<<<blocks, threads>>>(d_px, d_dist, M_t, M_w, steps_per_round, dp_mask,
                                         d_dpx, d_dpdist, d_dptype, cap);
+#endif
         CUDA_OK(cudaDeviceSynchronize());
         total_steps += steps_per_round;
 
@@ -455,32 +630,29 @@ int main(int argc, char **argv) {
         if (cnt > cap) cnt = cap;
         if (cnt == 0) continue;
         CUDA_OK(cudaMemcpy(hx.data(), d_dpx, (size_t)cnt * 8 * sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        CUDA_OK(cudaMemcpy(hdist.data(), d_dpdist, (size_t)cnt * sizeof(uint64_t), cudaMemcpyDeviceToHost));
         CUDA_OK(cudaMemcpy(htype.data(), d_dptype, (size_t)cnt * sizeof(uint8_t), cudaMemcpyDeviceToHost));
+#ifdef NEGMAP
+        CUDA_OK(cudaMemcpy(hdist.data(), d_dpdist, (size_t)cnt * sizeof(int64_t), cudaMemcpyDeviceToHost));
+        CUDA_OK(cudaMemcpy(hsgn.data(), d_dpsgn, (size_t)cnt * sizeof(int8_t), cudaMemcpyDeviceToHost));
+#else
+        CUDA_OK(cudaMemcpy(hdist.data(), d_dpdist, (size_t)cnt * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+#endif
 
         for (uint32_t i = 0; i < cnt && !solved; i++) {
             std::string key((const char *)&hx[(size_t)i * 8], 32);
-            uint64_t dval = hdist[i];
-            if (htype[i] == 0) {  // tame: T
+#ifdef NEGMAP
+            int64_t w = hdist[i]; int8_t a = hsgn[i];
+#else
+            int64_t w = (int64_t)hdist[i]; int8_t a = (htype[i] == 0) ? 0 : 1;  // tame a=0, wild a=+1
+#endif
+            if (htype[i] == 0) {  // tame
                 auto it = wild_map.find(key);
-                if (it != wild_map.end()) {
-                    uint64_t Tt = dval, Dw = it->second;
-                    if (Tt >= Dw) {
-                        uint64_t dprime = Tt - Dw, cand = lo + dprime;
-                        if (cand >= lo && cand <= hi) { found_cand = cand; solved = 1; break; }
-                    }
-                }
-                if (tame_map.find(key) == tame_map.end()) tame_map[key] = dval;
-            } else {              // wild: D
+                if (it != wild_map.end() && try_pair(a, w, it->second.a, it->second.w)) { solved = 1; break; }
+                if (tame_map.find(key) == tame_map.end()) tame_map[key] = {w, a};
+            } else {              // wild
                 auto it = tame_map.find(key);
-                if (it != tame_map.end()) {
-                    uint64_t Tt = it->second, Dw = dval;
-                    if (Tt >= Dw) {
-                        uint64_t dprime = Tt - Dw, cand = lo + dprime;
-                        if (cand >= lo && cand <= hi) { found_cand = cand; solved = 1; break; }
-                    }
-                }
-                if (wild_map.find(key) == wild_map.end()) wild_map[key] = dval;
+                if (it != tame_map.end() && try_pair(it->second.a, it->second.w, a, w)) { solved = 1; break; }
+                if (wild_map.find(key) == wild_map.end()) wild_map[key] = {w, a};
             }
         }
     }
@@ -490,7 +662,13 @@ int main(int argc, char **argv) {
     double jumps = (double)total_steps * (double)M;
     fprintf(stderr, "[kangaroo] rounds done: total_steps/kangaroo=%llu jumps=%.3e time=%.1fms jumps/s=%.3e\n",
             (unsigned long long)total_steps, jumps, ms, jumps / (ms / 1000.0));
+#ifdef NEGMAP
+    { unsigned long long esc = 0; cudaMemcpyFromSymbol(&esc, d_escapes, sizeof(esc));
+      fprintf(stderr, "[kangaroo] negmap escapes fired: %llu (%.4f per jump)\n",
+              esc, (double)esc / (jumps > 0 ? jumps : 1)); }
+#endif
 
+    fprintf(stderr, "[kangaroo] distinct DPs: tame=%zu wild=%zu\n", tame_map.size(), wild_map.size());
     if (!solved) { fprintf(stderr, "[kangaroo] FAILED: no collision within budget\n"); return 1; }
 
     // ---- final bit-exact verification on device: cand*G == Q ----
