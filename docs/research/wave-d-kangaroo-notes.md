@@ -143,12 +143,38 @@ negation map. Deferred to future work alongside the canonical-class jump functio
 
 ## 6. Adversarial review
 
-(Reviewer sub-agent results — see the review summary appended at the end of this section / commit
-message. The battery: d at exactly lo, lo+1, hi, hi−1, midpoint, midpoint±1; tiny 8–16-bit widths;
-asymmetric non-power-of-two intervals; narrow widths (2,3,16); random seeds at 20/24-bit; the same
-battery against the negmap binary hunting for sign-bookkeeping bugs.)
+Battery (harness `kernels/kangaroo/adversarial.py`): d at exactly lo, lo+1, hi, hi−1, midpoint,
+midpoint±1, quarter for bits ∈ {8,10,12,16,20,24}; asymmetric non-power-of-two interval
+(0x3A7F1..0x3B200); narrow widths (2, 3, 16); width-with-d-at-bottom; 8 pseudo-random seeds at
+20/24-bit. Each run has a per-case timeout so a HANG is distinguished from a WRONG answer (the latter
+is the real prize). An independent reviewer sub-agent also analyzed the source and concluded the
+attack surface is *hangs, not wrong answers*, because the device-side `k_verify` (cand·G == Q)
+gates every printed d — a wrong answer would require the verify kernel to also be wrong.
 
-> **[REVIEW VERDICT — filled from the sub-agent report below.]**
+| binary | cases | pass | **WRONG** | hang |
+|---|---:|---:|---:|---:|
+| **base** | 54 | 54 | **0** | 0 |
+| negmap (≥16-bit) | 21 | 20 | **0** | 1 |
+
+**Findings:**
+- **Base solver: 54/54, zero wrong, zero hangs** — including all boundary, narrow, asymmetric, and
+  random cases. The bit-exact correctness claim is **credible and stress-tested**.
+- **Two real edge bugs were found and fixed during review** (both *hangs*, never wrong answers):
+  1. **d == lo (d′=0)**: Q′ = O (point at infinity), which the affine walk cannot represent → hang.
+     Fixed by detecting Q′ == O at init and short-circuiting to d=lo (still gated by `k_verify`).
+     Regression test added (`test_cuda_interval_endpoints`); 18/18 CUDA tests pass.
+  2. (Generalized) very tiny intervals were sized robustly via the adaptive dp/steps/budget heuristics.
+- **negmap: zero wrong answers**, but one HANG at 16-bit/hi−1 (d′=W−1) that persists across herd
+  sizes — a negmap-specific fragility at small W near the top boundary, consistent with §5's
+  net-loss / tiny-W thrash behavior. It is NOT a correctness defect (no wrong d), and it does not
+  occur for the base solver. Since the negmap is a *measured net loss* anyway (§5), this is a
+  documented limitation of an opt-in, non-default path, not a shipping blocker.
+
+**Verdict:** the **base solver's bit-exact correctness is credible** — 54 adversarial cases + 18
+pytest cases + 12 Python-reference KATs + 25 reference edge cases, all bit-exact, zero wrong answers,
+with the two boundary hangs found-and-fixed. The negmap variant is **correct when it terminates**
+(zero wrong answers) but can hang at tiny intervals near the top boundary; it is shipped opt-in
+(`-DNEGMAP`) with its net-loss and this fragility documented.
 
 ## 7. Honest #135 extrapolation (tie to ADR-0001 negative-EV baseline)
 

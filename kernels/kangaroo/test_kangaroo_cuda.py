@@ -72,3 +72,25 @@ def test_cuda_recovers_d_bit_exact(solver_bin, katfile):
     assert recovered == expected, (
         f"{katfile}: recovered 0x{recovered:x} != expected 0x{expected:x}"
     )
+
+
+# Boundary regression: d == lo (d'=0) makes Q' = O (point at infinity), which the affine walk cannot
+# represent — it must be short-circuited, not walked (else it hangs). d == hi (d'=W) is a large but
+# ordinary offset and must walk normally. Both adversarial endpoints, both bit-exact.
+from coincurve import PublicKey  # noqa: E402
+
+
+def _endpoint_kat(bits, where):
+    lo = 1 << bits
+    hi = (1 << (bits + 1)) - 1
+    d = lo if where == "lo" else hi
+    Q = PublicKey.from_valid_secret(d.to_bytes(32, "big")).format(compressed=True).hex()
+    return {"lo_hex": f"{lo:064x}", "hi_hex": f"{hi:064x}", "Q_compressed_hex": Q}, d
+
+
+@pytest.mark.parametrize("bits", [16, 20, 24])
+@pytest.mark.parametrize("where", ["lo", "hi"])
+def test_cuda_interval_endpoints(solver_bin, bits, where):
+    kat, d = _endpoint_kat(bits, where)
+    recovered = _solve(solver_bin, kat, timeout=60)
+    assert recovered == d, f"bits={bits} where={where}: 0x{recovered:x} != 0x{d:x}"

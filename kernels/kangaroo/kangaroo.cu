@@ -50,6 +50,7 @@ __device__ uint64_t d_jumpscalar[K_JUMPS]; // s[i] (kept on device so the walk a
 __device__ affpt   d_Qp;                // shifted target Q' = Q - lo*G (affine)
 __device__ uint32_t d_dpcount;          // atomic DP write index for the current round
 __device__ unsigned long long d_escapes; // negmap diagnostic: count of fruitless-cycle escapes fired
+__device__ int      d_Qp_is_inf;        // 1 if Q' == O (i.e. d == lo, d'=0): boundary, answer is lo
 
 // ----- field helper: negate mod p (y -> p - y), used by the negation map ----
 __device__ __forceinline__ void fe_negate(fe *r, const fe *a) {
@@ -137,6 +138,10 @@ __global__ void k_init_global(const uint8_t *Q_comp, const uint32_t *neg_lo,
     for (int i = 0; i < 8; i++) nl[i] = neg_lo[i];
     jpoint negloG; scalar_mul_G(&negloG, nl);
     jpoint jQp; jpoint_add(&jQp, &jQ, &negloG);
+    // Q' == O exactly when d == lo (d'=0): the bottom-of-interval boundary. The affine walk cannot
+    // represent infinity, so flag it; the host short-circuits to d=lo (verified by k_verify).
+    if (jpoint_is_infinity(&jQp)) { d_Qp_is_inf = 1; fe_set_zero(&d_Qp.x); fe_set_zero(&d_Qp.y); return; }
+    d_Qp_is_inf = 0;
     fe ax, ay; jpoint_to_affine(&ax, &ay, &jQp);
     fe_copy(&d_Qp.x, &ax); fe_copy(&d_Qp.y, &ay);
 }
@@ -557,6 +562,18 @@ int main(int argc, char **argv) {
     // ---- setup ----
     k_init_global<<<1, 1>>>(d_Q, d_neglo, d_jscal);
     CUDA_OK(cudaDeviceSynchronize());
+    // Boundary: Q' == O <=> d == lo (d'=0). The affine walk can't represent infinity, so short-circuit
+    // to d=lo and verify it on-device before printing (still a real cand*G==Q check, no shortcut on
+    // correctness). Symmetric to d==hi which the walk handles normally (d'=W is just a large offset).
+    int qp_inf = 0; CUDA_OK(cudaMemcpyFromSymbol(&qp_inf, d_Qp_is_inf, sizeof(int)));
+    if (qp_inf) {
+        int hok = 0; k_verify<<<1, 1>>>(lo, d_Q, d_ok); CUDA_OK(cudaDeviceSynchronize());
+        CUDA_OK(cudaMemcpy(&hok, d_ok, sizeof(int), cudaMemcpyDeviceToHost));
+        if (hok) { printf("d=%llx\n", (unsigned long long)lo);
+                   fprintf(stderr, "[kangaroo] SOLVED d=0x%llx (d'=0 boundary; verified cand*G==Q)\n",
+                           (unsigned long long)lo); return 0; }
+        fprintf(stderr, "[kangaroo] Q'==O but lo*G != Q ?! (should be impossible)\n"); return 1;
+    }
     uint64_t stride_t = W / M_t; if (stride_t < 1) stride_t = 1;
     uint64_t stride_w = W / M_w; if (stride_w < 1) stride_w = 1;
     int threads = 256, blocks = (M + threads - 1) / threads;
